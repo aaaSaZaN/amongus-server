@@ -1,0 +1,19 @@
+[Unit]
+Description=Among Us 3D VR private Photon server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/amongus-photon.env
+WorkingDirectory=/opt/amongus-photon
+ExecStart=/opt/amongus-photon/.venv/bin/python -u photon.py --public ${PUBLIC_ADDRESS}
+Restart=on-failure
+RestartSec=3
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

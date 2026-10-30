@@ -1,0 +1,8 @@
+services:
+  photon:
+    build: .
+    # Host networking: Photon is plain UDP and clients must reach the exact
+    # address the server hands out in its replies.
+    network_mode: host
+    command: ["--public", "${PUBLIC_ADDRESS:?set PUBLIC_ADDRESS in .env}"]
+    restart: unless-stopped
