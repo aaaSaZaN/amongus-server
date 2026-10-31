@@ -7,18 +7,24 @@ exchange, encrypted auth, master, game join and event relay between two actors.
 Usage: python3 test_local.py [capture.pcap]
 """
 import asyncio
+import json
 import os
 import socket
 import struct
 import sys
+import tempfile
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import crypto  # noqa: E402
 import enet  # noqa: E402
 import photon  # noqa: E402
+import settings  # noqa: E402
 import protocol18 as p18  # noqa: E402
 from protocol18 import Byte, StrDict  # noqa: E402
+
+STATUS_ADDRESS = ("127.0.0.1", 28080)
 
 
 def check_roundtrip():
@@ -72,6 +78,92 @@ def check_addresses():
     print("ok: address chosen by client network")
 
 
+def check_settings():
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, ".env")
+        with open(path, "w", encoding="utf-8-sig", newline="\r\n") as file:
+            file.write("TEST_FROM_FILE=100.64.0.10\n# TEST_COMMENT=1\nTEST_FROM_SHELL=file\n")
+        os.environ["TEST_FROM_SHELL"] = "shell"
+        settings.load(path)
+        settings.load(os.path.join(folder, "missing"))
+    assert settings.text("TEST_FROM_FILE") == "100.64.0.10"
+    assert settings.text("TEST_FROM_SHELL") == "shell", "the environment wins over the file"
+    assert settings.text("TEST_COMMENT") is None
+    assert settings.number("TEST_MISSING", 1.1) == 1.1
+    print("ok: settings from .env with Windows line ends and byte order mark")
+
+
+def check_ping():
+    class Transport:
+        def __init__(self):
+            self.packets = []
+
+        def sendto(self, data, addr):
+            self.packets.append(data)
+
+    class Handler:
+        def on_close(self, conn):
+            pass
+
+    def commands(kind):
+        return [p for p in transport.packets if p[12] == kind]
+
+    def ack(seq, sent):
+        body = struct.pack(">BBBBII", enet.ACK, enet.CONTROL_CHANNEL, 0, 0, 20, 0) + struct.pack(">II", seq, sent)
+        conn.handle(struct.pack(">HBBII", 0, 0, 1, 0, 1) + body)
+
+    clock = [1000.0]
+    real_time = enet.time
+    enet.time = types.SimpleNamespace(monotonic=lambda: clock[0])
+    try:
+        transport = Transport()
+        conn = enet.Connection(transport, ("127.0.0.1", 1), 1, Handler())
+        clock[0] += 5
+        conn.tick()
+        assert not commands(enet.PING), "no pings before the player is in a room"
+
+        conn.ping_enabled = True
+        interval, enet.PING_INTERVAL = enet.PING_INTERVAL, 0
+        conn.tick()
+        enet.PING_INTERVAL = interval
+        assert not commands(enet.PING), "interval 0 turns pings off"
+
+        conn.tick()
+        ping = commands(enet.PING)[0]
+        assert ping[13:16] == bytes([enet.CONTROL_CHANNEL, enet.FLAG_RELIABLE, 0])
+        assert struct.unpack_from(">II", ping, 16) == (12, 1)
+
+        sent = struct.unpack_from(">I", ping, 4)[0]
+        clock[0] += 0.05
+        ack(1, sent)
+        assert conn.rtt == 50 and not conn.pending
+        ack(1, sent - 5000)
+        assert conn.rtt == 50, "a repeated ack is not a sample"
+
+        for _ in range(20):
+            clock[0] += 1
+            conn.tick()
+            conn.last_seen = clock[0] - 1
+        assert not conn.closed, "a lost ping must not close the connection"
+        assert {struct.unpack_from(">I", p, 20)[0] for p in commands(enet.PING)} == {1, 2}, "one ping at a time"
+
+        clock[0] += enet.IDLE_TIMEOUT + 1
+        conn.tick()
+        assert conn.closed, "silence still ends in the idle timeout"
+    finally:
+        enet.time = real_time
+    print("ok: ping matches the cloud command, rtt from acks, idle timeout unchanged")
+
+
+async def http_get(path):
+    reader, writer = await asyncio.open_connection(*STATUS_ADDRESS)
+    writer.write(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    await writer.drain()
+    head, _, body = (await reader.read()).partition(b"\r\n\r\n")
+    writer.close()
+    return int(head.split()[1]), body
+
+
 class Client:
     def __init__(self, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -112,6 +204,7 @@ class Client:
         while True:
             data = await asyncio.wait_for(self.loop.sock_recv(self.sock, 4096), 2)
             count = data[3]
+            sent = struct.unpack_from(">I", data, 4)[0]
             offset = 12
             for _ in range(count):
                 kind, channel, flags, _, size, seq = struct.unpack_from(">BBBBII", data, offset)
@@ -119,7 +212,7 @@ class Client:
                 body = data[offset + head:offset + size]
                 offset += size
                 if flags & 1:
-                    self._send(self._cmd(enet.ACK, channel, 0, 0, struct.pack(">II", seq, 1)))
+                    self._send(self._cmd(enet.ACK, channel, 0, 0, struct.pack(">II", seq, sent)))
                 if kind == enet.VERIFY:
                     self.peer = struct.unpack_from(">H", body)[0]
                     return ("verify", None, body)
@@ -154,6 +247,14 @@ class Client:
         self.send_encrypted(message) if encrypted else self.send(message)
 
 
+async def drain(client, seconds):
+    """Keep answering the server, as a headset does between game messages."""
+    try:
+        await asyncio.wait_for(client.recv(-1), seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def enter(room, mode, public_port=photon.FUSION):
     name = Client(public_port["name"])
     await name.connect()
@@ -179,7 +280,7 @@ async def enter(room, mode, public_port=photon.FUSION):
 
 
 async def check_flow():
-    task = asyncio.create_task(photon.run("127.0.0.1", "127.0.0.1"))
+    task = asyncio.create_task(photon.run("127.0.0.1", "127.0.0.1", status_address=STATUS_ADDRESS))
     await asyncio.sleep(0.2)
 
     master = Client(photon.FUSION["master"])
@@ -258,6 +359,19 @@ async def check_flow():
     assert received[1][0] == 5 and struct.unpack_from("<iI", received[1], 14) == (1, 4)
     print("ok: client gets Start right after join confirmation")
 
+    await asyncio.gather(drain(host, 1.5), drain(guest, 1.5))
+    code, body = await http_get("/api/status")
+    status = json.loads(body)
+    room = status["rooms"][0]
+    assert code == 200 and status["players"] == 2 and room["code"] == "ABCDEF"
+    assert room["map"] == "Polus Point" and [p["actor"] for p in room["players"]] == [1, 2]
+    assert room["players"][0]["host"] and not room["players"][1]["host"]
+    assert all(p["ping"] is not None and p["ping"] < 100 and not p["voice"] for p in room["players"])
+    code, page = await http_get("/")
+    assert code == 200 and b"api/status" in page
+    assert (await http_get("/nope"))[0] == 404
+    print("ok: dashboard lists the room, players and their ping")
+
     task.cancel()
 
 
@@ -265,6 +379,8 @@ def main():
     check_roundtrip()
     check_crypto()
     check_addresses()
+    check_settings()
+    check_ping()
     if len(sys.argv) > 1:
         check_capture(sys.argv[1])
     asyncio.run(check_flow())

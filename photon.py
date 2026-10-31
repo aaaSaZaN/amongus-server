@@ -10,12 +10,15 @@ import asyncio
 import ipaddress
 import logging
 import secrets
+import time
 import uuid
 
 import crypto
+import dashboard
 import enet
 import fusion_plugin
 import protocol18 as p18
+import settings
 from protocol18 import Byte, StrDict
 
 log = logging.getLogger("photon")
@@ -58,7 +61,8 @@ class Room:
         number = self.next_actor
         self.next_actor += 1
         self.actors[number] = connection
-        connection.state.update(room=self, actor=number, props=properties or {})
+        connection.state.update(room=self, actor=number, props=properties or {}, joined=time.monotonic())
+        connection.ping_enabled = True
         self.master = self.master or number
         return number
 
@@ -255,16 +259,19 @@ class Server:
         self.leave(conn)
 
 
-async def run(public, host, netbird=None):
+async def run(public, host, netbird=None, status_address=None):
     loop = asyncio.get_running_loop()
     listeners = []
+    all_rooms = {}
     for label, ports in (("fusion", FUSION), ("voice", VOICE)):
-        rooms = {}
+        rooms = all_rooms[label] = {}
         for role, port in ports.items():
             server = Server(role, ports, public, rooms, f"{label}-{role}", netbird)
             _, listener = await loop.create_datagram_endpoint(lambda s=server: enet.Listener(s), local_addr=(host, port))
             listeners.append(listener)
             log.info("listening on %s:%s as %s-%s", host, port, label, role)
+    if status_address:
+        status_task = loop.create_task(dashboard.serve(status_address, all_rooms["fusion"], all_rooms["voice"]))
     while True:
         await asyncio.sleep(0.1)
         for listener in listeners:
@@ -273,12 +280,15 @@ async def run(public, host, netbird=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--public", required=True, help="address headsets use to reach this server")
+    public = settings.text("PUBLIC_ADDRESS")
+    parser.add_argument("--public", default=public, required=not public, help="address headsets use to reach this server")
     parser.add_argument("--netbird", help="this server's NetBird address, given to NetBird clients")
     parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--dashboard", type=dashboard.parse_address, default=settings.text("DASHBOARD", "127.0.0.1:8080"),
+                        metavar="HOST:PORT", help="serve the status page on this address")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    asyncio.run(run(args.public, args.host, args.netbird))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", filename=settings.text("LOG_FILE"))
+    asyncio.run(run(args.public, args.host, args.netbird, args.dashboard))
 
 
 if __name__ == "__main__":

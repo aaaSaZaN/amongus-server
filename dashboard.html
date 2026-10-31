@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Among Us VR сервер</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --surface: #fcfcfb;
+  --panel: #f3f2ee;
+  --line: #dedcd5;
+  --ink: #0b0b0b;
+  --muted: #52514e;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #1a1a19;
+    --panel: #252523;
+    --line: #3a3a37;
+    --ink: #ffffff;
+    --muted: #c3c2b7;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  padding: 24px 16px 40px;
+  max-width: 760px;
+  background: var(--surface);
+  color: var(--ink);
+  font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+h1 { margin: 0; font-size: 18px; font-weight: 600; }
+h2 { margin: 0; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.note { color: var(--muted); font-size: 14px; }
+.stats { display: flex; gap: 12px; margin: 16px 0 24px; }
+.stat { flex: 1; padding: 12px 16px; background: var(--panel); border-radius: 8px; }
+.stat b { display: block; font-size: 32px; line-height: 1.2; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 14px; }
+.room { margin-bottom: 24px; }
+.room header { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin-bottom: 8px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th { color: var(--muted); font-size: 14px; font-weight: 400; text-align: left; }
+th, td { padding: 8px 16px 8px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+@media (max-width: 480px) {
+  table { font-size: 14px; }
+  th { font-size: 13px; }
+  th, td { padding-right: 8px; }
+  .dot { margin-right: 4px; }
+}
+.dot { display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; }
+.good { background: var(--good); }
+.warning { background: var(--warning); }
+.critical { background: var(--critical); }
+#offline { display: none; padding: 8px 12px; margin-top: 16px; border: 1px solid var(--critical); border-radius: 8px; }
+.stale #content, .stale .stats { opacity: .5; }
+.stale #offline { display: block; }
+</style>
+</head>
+<body>
+<h1>Among Us VR сервер</h1>
+<div id="offline"><span class="dot critical"></span>Сервер не отвечает, данные устарели</div>
+<div class="stats">
+  <div class="stat"><b id="players">–</b><span>игроков</span></div>
+  <div class="stat"><b id="rooms">–</b><span>лобби</span></div>
+  <div class="stat"><b id="uptime">–</b><span>работает</span></div>
+</div>
+<div id="content"></div>
+<p class="note">Пинг считается от сервера до шлема. Обновляется каждые 3 секунды.</p>
+<script>
+const REFRESH_MS = 3000;
+const NO_LINK_AFTER = 5;
+
+function el(tag, text) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function duration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  if (hours) return `${hours} ч ${minutes} мин`;
+  if (minutes) return `${minutes} мин`;
+  return `${seconds} с`;
+}
+
+function pingCell(player) {
+  const cell = el("td");
+  let kind = "good", text;
+  if (player.silent >= NO_LINK_AFTER) {
+    kind = "critical";
+    text = `нет связи ${player.silent} с`;
+  } else if (player.ping === null) {
+    cell.textContent = "измеряется";
+    return cell;
+  } else {
+    if (player.ping >= 120) kind = "critical";
+    else if (player.ping >= 60) kind = "warning";
+    const label = {good: "хороший", warning: "средний", critical: "высокий"}[kind];
+    text = `${player.ping} мс, ${label}`;
+  }
+  const dot = el("span");
+  dot.className = `dot ${kind}`;
+  cell.append(dot, text);
+  return cell;
+}
+
+function playerRow(player) {
+  const row = el("tr");
+  row.append(el("td", player.ip), el("td", player.host ? "хост" : "игрок"), pingCell(player),
+             el("td", player.voice ? "да" : "нет"), el("td", duration(player.seconds)));
+  return row;
+}
+
+function roomBlock(room) {
+  const block = el("section");
+  block.className = "room";
+  const header = el("header");
+  const details = [room.map, room.in_game ? "идёт игра" : "в лобби"].filter(Boolean).join(", ");
+  const seats = room.max_players ? `${room.players.length} из ${room.max_players}` : room.players.length;
+  const info = el("span", `${details}, игроков: ${seats}`);
+  info.className = "note";
+  header.append(el("h2", room.code), info);
+  const table = el("table");
+  const head = el("tr");
+  for (const title of ["Адрес", "Роль", "Пинг", "Голос", "В лобби"]) head.append(el("th", title));
+  table.append(head, ...room.players.map(playerRow));
+  const scroll = el("div");
+  scroll.className = "scroll";
+  scroll.append(table);
+  block.append(header, scroll);
+  return block;
+}
+
+function render(status) {
+  document.getElementById("players").textContent = status.players;
+  document.getElementById("rooms").textContent = status.rooms.length;
+  document.getElementById("uptime").textContent = duration(status.uptime);
+  const content = document.getElementById("content");
+  if (status.rooms.length) {
+    content.replaceChildren(...status.rooms.map(roomBlock));
+  } else {
+    const empty = el("p", "Лобби пока нет.");
+    empty.className = "note";
+    content.replaceChildren(empty);
+  }
+}
+
+async function refresh() {
+  if (document.hidden) return;
+  try {
+    const answer = await fetch("api/status", {cache: "no-store"});
+    if (!answer.ok) throw new Error(answer.status);
+    render(await answer.json());
+    document.body.classList.remove("stale");
+  } catch {
+    document.body.classList.add("stale");
+  }
+}
+
+setInterval(refresh, REFRESH_MS);
+document.addEventListener("visibilitychange", refresh);
+refresh();
+</script>
+</body>
+</html>

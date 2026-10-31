@@ -4,6 +4,8 @@ import secrets
 import struct
 import time
 
+import settings
+
 ACK, CONNECT, VERIFY, DISCONNECT, PING, RELIABLE, UNRELIABLE, FRAGMENT = 1, 2, 3, 4, 5, 6, 7, 8
 UNSEQUENCED, SERVER_TIME = 11, 12
 CONTROL_CHANNEL = 255
@@ -11,7 +13,10 @@ FLAG_RELIABLE, FLAG_UNSEQUENCED = 1, 2
 FRAGMENT_SIZE = 1152
 RESEND_AFTER = 0.3
 GIVE_UP_AFTER = 20.0
-IDLE_TIMEOUT = 60.0
+IDLE_TIMEOUT = settings.number("IDLE_TIMEOUT", 60)
+PING_INTERVAL = settings.number("PING_INTERVAL", 1.1)  # 0 turns pings off
+RTT_LIMIT_MS = 10000
+RTT_WEIGHT = 0.2
 PING_PACKET_SIZE = 13
 PING_PREFIX = b"\x7d" * 12
 
@@ -38,6 +43,10 @@ class Connection:
         self.last_seen = time.monotonic()
         self.closed = False
         self.state = {}
+        self.rtt = None
+        self.ping_enabled = False
+        self.ping_seq = 0
+        self.ping_sent = time.monotonic()
 
     def _packet(self, *commands):
         head = struct.pack(">HBBII", 0, 0, len(commands), now_ms(), self.challenge)
@@ -78,6 +87,21 @@ class Connection:
     def _ack(self, channel, seq, sent):
         self._packet(self._command(ACK, channel, 0, 0, struct.pack(">II", seq, sent)))
 
+    def _ping_key(self):
+        return (CONTROL_CHANNEL, self.ping_seq)
+
+    def _ping(self, current):
+        """Same command the Photon cloud sends: reliable, control channel, own numbering."""
+        self.ping_seq += 1
+        self.ping_sent = current
+        self._send_tracked(CONTROL_CHANNEL, self.ping_seq, self._command(PING, CONTROL_CHANNEL, FLAG_RELIABLE, self.ping_seq))
+
+    def _measure(self, echoed):
+        """An ACK carries the send time of the packet it confirms."""
+        sample = (now_ms() - echoed) & 0xFFFFFFFF
+        if sample < RTT_LIMIT_MS:
+            self.rtt = sample if self.rtt is None else self.rtt + RTT_WEIGHT * (sample - self.rtt)
+
     def handle(self, data):
         self.last_seen = time.monotonic()
         _, _, count, sent, _ = struct.unpack_from(">HBBII", data)
@@ -95,8 +119,9 @@ class Connection:
         if flags & FLAG_RELIABLE:
             self._ack(channel, seq, sent)
         if kind == ACK:
-            acked, _ = struct.unpack_from(">II", payload)
-            self.pending.pop((channel, acked), None)
+            acked, echoed = struct.unpack_from(">II", payload)
+            if self.pending.pop((channel, acked), None):
+                self._measure(echoed)
         elif kind == CONNECT:
             if not self.out_seq.get(CONTROL_CHANNEL):
                 body = struct.pack(">H", self.peer_id) + payload[2:12] + bytes(20)
@@ -141,12 +166,15 @@ class Connection:
             self.close()
             return
         for key, item in list(self.pending.items()):
-            if current - item[2] > GIVE_UP_AFTER:
+            # An unanswered ping must not cut the idle timeout down to GIVE_UP_AFTER.
+            if current - item[2] > GIVE_UP_AFTER and key != self._ping_key():
                 self.close()
                 return
             if current - item[1] > RESEND_AFTER:
                 item[1] = current
                 self._packet(item[0])
+        if PING_INTERVAL and self.ping_enabled and current - self.ping_sent > PING_INTERVAL and self._ping_key() not in self.pending:
+            self._ping(current)
 
     def close(self):
         if not self.closed:
